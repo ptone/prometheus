@@ -19,24 +19,14 @@ import (
 	"fmt"
 	_ "net/http/pprof" // Comment this line to disable pprof endpoint.
 	"os"
-	"os/signal"
-	"syscall"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
-	"golang.org/x/net/context"
 
 	"github.com/prometheus/prometheus/config"
-	"github.com/prometheus/prometheus/notifier"
-	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/retrieval"
-	"github.com/prometheus/prometheus/rules"
-	"github.com/prometheus/prometheus/storage"
-	"github.com/prometheus/prometheus/storage/local"
-	"github.com/prometheus/prometheus/storage/remote"
-	"github.com/prometheus/prometheus/web"
 )
 
 func main() {
@@ -60,6 +50,23 @@ func init() {
 	prometheus.MustRegister(version.NewCollector("prometheus"))
 }
 
+func visitFlag(f *flag.Flag) {
+	fmt.Println("# ", f.Usage)
+	// TODO consider replacing hyphens with underscores as well to make names
+	// more uniform?
+	fmt.Println(strings.Replace(f.Name, ".", "_", -1), ": ", f.DefValue)
+	fmt.Println()
+}
+
+func visitFlagArgs(f *flag.Flag) {
+	fmt.Printf("          - \"-%s={{.Values.%s", f.Name, strings.Replace(f.Name, ".", "_", -1))
+	if name, _ := flag.UnquoteUsage(f); name == "string" {
+		// Not needed, quoted in yaml already
+		// fmt.Printf(" | quote ")
+	}
+	fmt.Printf("}}\"\n")
+}
+
 // Main manages the startup and shutdown lifecycle of the entire Prometheus server.
 func Main() int {
 	if err := parse(os.Args[1:]); err != nil {
@@ -68,172 +75,12 @@ func Main() int {
 	}
 
 	if cfg.printVersion {
-		fmt.Fprintln(os.Stdout, version.Print("prometheus"))
+		// fmt.Fprintln(os.Stdout, version.Print("prometheus"))
 		return 0
 	}
 
-	log.Infoln("Starting prometheus", version.Info())
-	log.Infoln("Build context", version.BuildContext())
-
-	var (
-		sampleAppender = storage.Fanout{}
-		reloadables    []Reloadable
-	)
-
-	var localStorage local.Storage
-	switch cfg.localStorageEngine {
-	case "persisted":
-		localStorage = local.NewMemorySeriesStorage(&cfg.storage)
-		sampleAppender = storage.Fanout{localStorage}
-	case "none":
-		localStorage = &local.NoopStorage{}
-	default:
-		log.Errorf("Invalid local storage engine %q", cfg.localStorageEngine)
-		return 1
-	}
-
-	remoteStorage, err := remote.New(&cfg.remote)
-	if err != nil {
-		log.Errorf("Error initializing remote storage: %s", err)
-		return 1
-	}
-	if remoteStorage != nil {
-		sampleAppender = append(sampleAppender, remoteStorage)
-		reloadables = append(reloadables, remoteStorage)
-	}
-
-	reloadableRemoteStorage := remote.NewConfigurable()
-	sampleAppender = append(sampleAppender, reloadableRemoteStorage)
-	reloadables = append(reloadables, reloadableRemoteStorage)
-
-	var (
-		notifier       = notifier.New(&cfg.notifier)
-		targetManager  = retrieval.NewTargetManager(sampleAppender)
-		queryEngine    = promql.NewEngine(localStorage, &cfg.queryEngine)
-		ctx, cancelCtx = context.WithCancel(context.Background())
-	)
-
-	ruleManager := rules.NewManager(&rules.ManagerOptions{
-		SampleAppender: sampleAppender,
-		Notifier:       notifier,
-		QueryEngine:    queryEngine,
-		Context:        ctx,
-		ExternalURL:    cfg.web.ExternalURL,
-	})
-
-	cfg.web.Context = ctx
-	cfg.web.Storage = localStorage
-	cfg.web.QueryEngine = queryEngine
-	cfg.web.TargetManager = targetManager
-	cfg.web.RuleManager = ruleManager
-
-	cfg.web.Version = &web.PrometheusVersion{
-		Version:   version.Version,
-		Revision:  version.Revision,
-		Branch:    version.Branch,
-		BuildUser: version.BuildUser,
-		BuildDate: version.BuildDate,
-		GoVersion: version.GoVersion,
-	}
-
-	cfg.web.Flags = map[string]string{}
-	cfg.fs.VisitAll(func(f *flag.Flag) {
-		cfg.web.Flags[f.Name] = f.Value.String()
-	})
-
-	webHandler := web.New(&cfg.web)
-
-	reloadables = append(reloadables, targetManager, ruleManager, webHandler, notifier)
-
-	if err := reloadConfig(cfg.configFile, reloadables...); err != nil {
-		log.Errorf("Error loading config: %s", err)
-		return 1
-	}
-
-	// Wait for reload or termination signals. Start the handler for SIGHUP as
-	// early as possible, but ignore it until we are ready to handle reloading
-	// our config.
-	hup := make(chan os.Signal)
-	hupReady := make(chan bool)
-	signal.Notify(hup, syscall.SIGHUP)
-	go func() {
-		<-hupReady
-		for {
-			select {
-			case <-hup:
-				if err := reloadConfig(cfg.configFile, reloadables...); err != nil {
-					log.Errorf("Error reloading config: %s", err)
-				}
-			case rc := <-webHandler.Reload():
-				if err := reloadConfig(cfg.configFile, reloadables...); err != nil {
-					log.Errorf("Error reloading config: %s", err)
-					rc <- err
-				} else {
-					rc <- nil
-				}
-			}
-		}
-	}()
-
-	// Start all components. The order is NOT arbitrary.
-
-	if err := localStorage.Start(); err != nil {
-		log.Errorln("Error opening memory series storage:", err)
-		return 1
-	}
-	defer func() {
-		if err := localStorage.Stop(); err != nil {
-			log.Errorln("Error stopping storage:", err)
-		}
-	}()
-
-	if remoteStorage != nil {
-		remoteStorage.Start()
-		defer remoteStorage.Stop()
-	}
-
-	defer reloadableRemoteStorage.Stop()
-
-	// The storage has to be fully initialized before registering.
-	if instrumentedStorage, ok := localStorage.(prometheus.Collector); ok {
-		prometheus.MustRegister(instrumentedStorage)
-	}
-	prometheus.MustRegister(notifier)
-	prometheus.MustRegister(configSuccess)
-	prometheus.MustRegister(configSuccessTime)
-
-	// The notifier is a dependency of the rule manager. It has to be
-	// started before and torn down afterwards.
-	go notifier.Run()
-	defer notifier.Stop()
-
-	go ruleManager.Run()
-	defer ruleManager.Stop()
-
-	go targetManager.Run()
-	defer targetManager.Stop()
-
-	// Shutting down the query engine before the rule manager will cause pending queries
-	// to be canceled and ensures a quick shutdown of the rule manager.
-	defer cancelCtx()
-
-	go webHandler.Run()
-
-	// Wait for reload or termination signals.
-	close(hupReady) // Unblock SIGHUP handler.
-
-	term := make(chan os.Signal)
-	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
-	select {
-	case <-term:
-		log.Warn("Received SIGTERM, exiting gracefully...")
-	case <-webHandler.Quit():
-		log.Warn("Received termination request via web service, exiting gracefully...")
-	case err := <-webHandler.ListenError():
-		log.Errorln("Error starting web server, exiting gracefully:", err)
-	}
-
-	log.Info("See you next time!")
+	cfg.fs.VisitAll(visitFlag)
+	cfg.fs.VisitAll(visitFlagArgs)
 	return 0
 }
 
